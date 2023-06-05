@@ -91,7 +91,7 @@ class LoaderCheckPonit:
                 if num_gpus < 2 and self.device_map is None:
                     model = LoaderClass.from_pretrained(checkpoint, config=self.config, torch_dtype=torch.bfloat16 if self.bf16 else torch.float16, trust_remote_code=True).half().cuda()
                 else:
-                    from accelerate  import dispatch_model
+                    from accelerate import dispatch_model
                     model = LoaderClass.from_pretrained(checkpoint, config=self.config, torch_dtype=torch.bfloat16 if self.bf16 else torch.float16, trust_remote_code=True).half()
                     if self.device_map is None:
                         if "chatglm" in model_name.lower():
@@ -104,8 +104,10 @@ class LoaderCheckPonit:
             else:
                 model = LoaderClass.from_pretrained(checkpoint, config=self.config, trust_remote_code=True).float().to(self.llm_device)
         elif self.is_llamacpp:
+            # TODO
             pass
         elif self.load_in_8bit:
+            # TODO
             pass
         else:
             print("Warning: self.llm_device is False.\nThis means that no use GPU  bring to be load CPU mode\n")
@@ -132,10 +134,72 @@ class LoaderCheckPonit:
     
     def _add_lora_to_model(self, lora_names: set):
         """merge lora weights with raw weights"""
-        pass
+        try:
+            from peft import PeftModel
+        except ImportError as exc:
+            raise ValueError(
+                "Could not import depend python package. "
+                "Please install it with `pip install peft``pip install accelerate`."
+            ) from exc
+        # 目前加载的lora
+        prior_set = set(self.lora_names)
+        # 需要加载的
+        added_set = set(lora_names) - prior_set
+        # 删除的lora
+        removed_set = prior_set - set(lora_names)
+        self.lora_names = list(lora_names)
+        # Nothing to do = skip.
+        if len(added_set) == 0 and len(removed_set) == 0:
+            return
+        # Only adding, and already peft? Do it the easy way.
+        if len(removed_set) == 0 and len(prior_set) > 0:
+            print(f"Adding the LoRA(s) named {added_set} to the model...")
+            for lora in added_set:
+                self.model.load_adapter(Path(f"{self.lora_dir}/{lora}"), lora)
+            return
+        # If removing anything, disable all and re-add.
+        if len(removed_set) > 0:
+            self.model.disable_adapter()
+        if len(lora_names) > 0:
+            print("Applying the following LoRAs to {}: {}".format(self.model_name, ', '.join(lora_names)))
+            params = {}
+            if self.llm_device.lower() != "cpu":
+                params['dtype'] = self.model.dtype
+                if hasattr(self.model, "hf_device_map"):
+                    params['device_map'] = {"base_model.model." + k: v for k, v in self.model.hf_device_map.items()}
+                elif self.load_in_8bit:
+                    params['device_map'] = {'': 0}
+            self.model.resize_token_embeddings(len(self.tokenizer))
+            self.model = PeftModel.from_pretrained(self.model, Path(f"{self.lora_dir}/{lora_names[0]}"), **params)
+            for lora in lora_names[1:]:
+                self.model.load_adapter(Path(f"{self.lora_dir}/{lora}"), lora)
+            if not self.load_in_8bit and self.llm_device.lower() != "cpu":
+                if not hasattr(self.model, "hf_device_map"):
+                    if torch.has_mps:
+                        device = torch.device('mps')
+                        self.model = self.model.to(device)
+                    else:
+                        self.model = self.model.cuda()
 
     def clear_torch_cache(self):
-        pass
+        gc.collect()
+        if self.llm_device.lower() != "cpu":
+            if torch.has_mps:
+                try:
+                    from torch.mps import empty_cache
+                    empty_cache()
+                except Exception as e:
+                    print(e)
+                    print(
+                        "如果您使用的是 macOS 建议将 pytorch 版本升级至 2.0.0 或更高版本，以支持及时清理 torch 产生的内存占用。")
+            elif torch.has_cuda:
+                device_id = "0" if torch.cuda.is_available() else None
+                CUDA_DEVICE = f"{self.llm_device}:{device_id}" if device_id else self.llm_device
+                with torch.cuda.device(CUDA_DEVICE):
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+            else:
+                print("未检测到 cuda 或 mps，暂不支持清理显存")
 
     def unload_model(self):
         del self.model
@@ -147,7 +211,32 @@ class LoaderCheckPonit:
         self.model_path = model_path
     
     def reload_model(self):
-        pass
+        self.unload_model()
+        self.model_config = self._load_config(model_name)
+        if self.use_ptuning_v2:
+            try:
+                prefix_encoder_file = open(Path(f'{self.ptuning_dir}/config.json'), 'r')
+                prefix_encoder_config = json.loads(prefix_encoder_file.read())
+                prefix_encoder_file.close()
+                self.model_config.pre_seq_len = prefix_encoder_config['pre_seq_len']
+                self.model_config.prefix_projection = prefix_encoder_config['prefix_projection']
+            except Exception as e:
+                print("加载PrefixEncoder config.json失败")
+        self.model, self.tokenizer = self._load_model(self.model_name)
+        if self.lora:
+            self._add_lora_to_model([self.lora])
+        if self.use_ptuning_v2:
+            try:
+                prefix_state_dict = torch.load(Path(f'{self.ptuning_dir}/pytorch_model.bin'))
+                new_prefix_state_dict = {}
+                for k, v in prefix_state_dict.items():
+                    if k.startswith("transformer.prefix_encoder."):
+                        new_prefix_state_dict[k[len("transformer.prefix_encoder."):]] = v
+                self.model.transformer.prefix_encoder.load_state_dict(new_prefix_state_dict)
+                self.model.transformer.prefix_encoder.float()
+            except Exception as e:
+                print("加载PrefixEncoder模型参数失败")
+        self.model = self.model.eval()
 
     def __chatglm_device_mapper(self, num_gpus: int) -> Dict[str, int]:
         num_trans_layers = 28
@@ -212,5 +301,17 @@ class LoaderCheckPonit:
             return device_map
     
     def __vicuna_device_mapper(self, num_gpus: int) -> Dict[str, int]:
-        pass
+        num_layers = 40
+        device_map = {'model.embed_tokens': 0, 'model.norm': num_gpus-1, 'lm_head': num_gpus-1}
+        per_gpu_layers = (num_layers+3) / num_gpus
+        gpu_target = 0
+        used = 1
+        for i in range(num_layers):
+            if used >= per_gpu_layers:
+                gpu_target += 1
+                used = 0
+            assert gpu_target < num_gpus
+            device_map[f'model.layers.{i}'] = gpu_target
+            used += 1
+        return device_map
 
